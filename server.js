@@ -83,12 +83,21 @@ const peerServer = ExpressPeerServer(server, {
 
 app.use('/', peerServer)
 
+/**
+ * Every client currently holding a broker socket, so a redeploy can close them
+ * deliberately (see `shutdown`). The broker keeps its own registry internally, but
+ * doesn't expose it; this is the only handle we get on the live sockets.
+ */
+const clients = new Set()
+
 // Structured, PII-free logs — matches the backend's logging shape.
 peerServer.on('connection', (client) => {
+  clients.add(client)
   console.log(JSON.stringify({ level: 'info', msg: 'peer connected', peerId: client.getId() }))
 })
 
 peerServer.on('disconnect', (client) => {
+  clients.delete(client)
   console.log(JSON.stringify({ level: 'info', msg: 'peer disconnected', peerId: client.getId() }))
 })
 
@@ -96,10 +105,54 @@ peerServer.on('error', (error) => {
   console.error(JSON.stringify({ level: 'error', msg: 'peer broker error', error: error.message }))
 })
 
-/** Render/most platforms send SIGTERM on redeploy — close listeners cleanly. */
+/** Last resort: stop waiting for the listener to drain and go. */
+const SHUTDOWN_TIMEOUT_MS = 10_000
+
+let shuttingDown = false
+
+/**
+ * Redeploy (Railway sends SIGTERM) — hand the sockets back before we go.
+ *
+ * `server.close()` on its own never finishes here. It stops accepting new connections
+ * and then waits for the open ones to end, and a broker WebSocket held by a browser
+ * sitting in a booth never ends on its own: the process would sit in that wait until
+ * the platform SIGKILLed it, and each client would discover the broker was gone only
+ * when its next call failed.
+ *
+ * Closing them ourselves is what makes a restart recoverable. The browser's PeerJS
+ * socket sees `onclose`, emits `disconnected`, and `usePeerConnection` asks for a
+ * throttled `reconnect()` — which keeps the same peer id, because the process that had
+ * claimed it is the one going away. Calls already up are peer-to-peer and never notice;
+ * what this buys is that the *next* negotiation works.
+ *
+ * Note this only runs at all if the platform gives us the time:
+ * `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` defaults to **0**, which is SIGKILL right
+ * behind SIGTERM. See the deploy notes in `README.md`.
+ */
+function shutdown(signal) {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(JSON.stringify({ level: 'info', msg: 'shutting down', signal, peers: clients.size }))
+
+  // Not awaited: its callback fires once the sockets below are gone.
+  server.close(() => process.exit(0))
+
+  for (const client of clients) {
+    try {
+      // 1001 "going away" says precisely what is happening: this endpoint is
+      // disappearing, so don't treat it as an error — come back.
+      client.getSocket()?.close(1001, 'broker restarting')
+    } catch {
+      // A socket that's already gone is the outcome we were after anyway.
+    }
+  }
+  clients.clear()
+
+  // A non-zero code so an incomplete drain is visible in the logs rather than looking
+  // like a clean stop.
+  setTimeout(() => process.exit(1), SHUTDOWN_TIMEOUT_MS).unref()
+}
+
 for (const signal of ['SIGTERM', 'SIGINT']) {
-  process.on(signal, () => {
-    console.log(JSON.stringify({ level: 'info', msg: 'shutting down', signal }))
-    server.close(() => process.exit(0))
-  })
+  process.on(signal, () => shutdown(signal))
 }
