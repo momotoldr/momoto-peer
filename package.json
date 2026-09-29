@@ -5,7 +5,7 @@
   "description": "Self-hosted PeerJS broker (WebRTC signaling) for Momoto.",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": "24.x"
   },
   "scripts": {
     "start": "node server.js",
