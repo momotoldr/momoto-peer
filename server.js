@@ -11,9 +11,12 @@
  *
  * Deployed as its own always-on service because the public PeerJS cloud rate-limits.
  */
+import { isIPv6 } from 'node:net'
+
 import cors from 'cors'
 import express from 'express'
 import { ExpressPeerServer } from 'peer'
+import { WebSocketServer } from 'ws'
 
 /** Reads a comma-separated env var into a trimmed, non-empty list. */
 function readList(value) {
@@ -46,12 +49,84 @@ if (corsOrigins.length === 0) {
   )
 }
 
+// The library's default is 5,000 connected peers, after which every new call fails. One
+// process holds far more than that: this only has to be low enough to protect its memory.
+const concurrentLimit = Number(process.env.PEER_CONCURRENT_LIMIT ?? 20_000)
+
+// Most sockets one address may hold. Generous because a whole campus or mobile carrier can
+// share one address; it exists so that one script can't occupy every slot above.
+const maxPerAddress = Number(process.env.PEER_MAX_PER_ADDRESS ?? 200)
+
+// Where the visitor's address is, behind Cloudflare. Same rule as momoto-realtime.
+const clientIpHeader = (process.env.CLIENT_IP_HEADER ?? 'cf-connecting-ip').trim().toLowerCase()
+
+/** The unit a per-address limit counts: the address, or the /64 for IPv6. */
+function addressKey(req) {
+  const raw = (clientIpHeader && req.headers[clientIpHeader]) || req.socket.remoteAddress || ''
+  const ip = String(raw).split(',')[0].trim()
+  if (ip.startsWith('::ffff:')) return ip.slice(7)
+  if (!isIPv6(ip)) return ip
+  const [head, tail = ''] = ip.split('::')
+  const left = head ? head.split(':') : []
+  const right = tail ? tail.split(':') : []
+  const zeros = Array(Math.max(0, 8 - left.length - right.length)).fill('0')
+  return `${[...left, ...zeros, ...right].slice(0, 4).join(':')}::/64`
+}
+
+const socketsByAddress = new Map()
+
+/**
+ * The broker's WebSocket server, with the checks its own options don't offer.
+ *
+ * CORS doesn't apply to a WebSocket, so without the origin check any web page could hold
+ * broker sockets open from its visitors' browsers. A non-browser client can forge `Origin`,
+ * which is what the per-address cap is for.
+ */
+function createWebSocketServer(options) {
+  const wss = new WebSocketServer({
+    ...options,
+    verifyClient: ({ origin, req }, done) => {
+      if (corsOrigins.length > 0 && !corsOrigins.includes(origin)) {
+        console.warn(JSON.stringify({ level: 'warn', msg: 'peer refused: origin', origin }))
+        done(false, 403, 'Forbidden')
+        return
+      }
+      if ((socketsByAddress.get(addressKey(req)) ?? 0) >= maxPerAddress) {
+        console.warn(JSON.stringify({ level: 'warn', msg: 'peer refused: address limit' }))
+        done(false, 429, 'Too Many Connections')
+        return
+      }
+      done(true)
+    },
+  })
+  wss.on('connection', (socket, req) => {
+    const key = addressKey(req)
+    socketsByAddress.set(key, (socketsByAddress.get(key) ?? 0) + 1)
+    socket.once('close', () => {
+      const left = (socketsByAddress.get(key) ?? 1) - 1
+      if (left > 0) socketsByAddress.set(key, left)
+      else socketsByAddress.delete(key)
+    })
+  })
+  return wss
+}
+
 const app = express()
 
 // Behind Render/Cloudflare, so the real client IP arrives in `X-Forwarded-For`.
 app.set('trust proxy', 1)
+app.disable('x-powered-by')
 
-app.use(cors({ origin: corsOrigins.length > 0 ? corsOrigins : false, credentials: true }))
+app.use((_req, res, next) => {
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('X-Frame-Options', 'DENY')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  next()
+})
+
+const corsOrigin = corsOrigins.length > 0 ? corsOrigins : false
+app.use(cors({ origin: corsOrigin, credentials: true }))
 
 // Registered before the broker so it wins the route when PEER_PATH is "/".
 app.get('/healthz', (_req, res) => {
@@ -79,6 +154,10 @@ const peerServer = ExpressPeerServer(server, {
   // Don't expose the list of connected peer ids — a room's peers find each other via
   // the room code from `momoto-realtime`, so discovery is unnecessary attack surface.
   allow_discovery: false,
+  concurrent_limit: concurrentLimit,
+  createWebSocketServer,
+  // The library mounts its own CORS, defaulting to any origin, over the one above.
+  corsOptions: { origin: corsOrigin },
 })
 
 app.use('/', peerServer)
